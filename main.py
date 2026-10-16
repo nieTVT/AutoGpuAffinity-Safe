@@ -244,7 +244,12 @@ def reset_affinity(hwids: list[str]) -> int:
     if not hwids:
         return 0
 
-    return apply_affinity(hwids)
+    try:
+        return apply_affinity(hwids)
+    except PermissionError:
+        # cleanup only: never turn a missing elevation into a traceback
+        LOG_CLI.warning("no permission to clear the affinity policy, skipped")
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +589,38 @@ def parse_args() -> argparse.Namespace:
 def is_admin() -> bool:
     return ctypes.windll.shell32.IsUserAnAdmin()
 
+CAPTURE_PRIVILEGE_HELP = (
+    "PresentMon needs to start an ETW trace session. That requires either\n"
+    "administrative privileges, or membership of the Windows group\n"
+    '"Performance Log Users" (S-1-5-32-559).\n'
+    "\n"
+    "How to fix:\n"
+    "  * easiest: launch 1-safe-mode.bat and accept the UAC prompt. Safe mode never\n"
+    "    touches the display device, so running it elevated is harmless.\n"
+    '  * or, once, from an elevated prompt: net localgroup "Performance Log Users" %USERNAME% /add\n'
+    "    then sign out and back in; after that safe mode works unelevated."
+)
+
+
+def has_capture_privilege() -> tuple[bool, str]:
+    # capturing frametimes means starting an etw trace session, which windows
+    # only allows for administrators and performance log users group members
+    if is_admin():
+        return True, "administrator"
+
+    try:
+        groups = subprocess.run(
+            ["whoami", "/groups"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+        if "S-1-5-32-559" in (groups or ""):
+            return True, "Performance Log Users"
+    except Exception:
+        pass
+
+    return False, "none"
 
 def kill_processes(*targets: str) -> None:
     # taskkill instead of psutil so the tool has no third party dependencies
@@ -663,8 +700,13 @@ def main() -> int:
             "by pinning the benchmark process instead",
         )
 
-    targets = select_affinity_targets(cfg)
-    hwids_gpu = [device.instance_id for device in targets]
+    if restart_mode:
+        targets = select_affinity_targets(cfg)
+        hwids_gpu = [device.instance_id for device in targets]
+    else:
+        # safe mode never writes the interrupt affinity policy, so there is
+        # nothing to select and nothing to reset
+        hwids_gpu = []
 
     if restart_mode:
         if not is_admin():
@@ -874,6 +916,15 @@ def main() -> int:
 
     kill_processes("xperf.exe", api_binname, presentmon_binary)
 
+    capture_ok, capture_how = has_capture_privilege()
+    if not capture_ok:
+        LOG_CLI.error("no privilege to start an ETW trace session")
+        print(CAPTURE_PRIVILEGE_HELP)
+        reset_affinity(hwids_gpu)
+        return 1
+
+    LOG_CLI.info("frametime capture privilege: %s", capture_how)
+
     for cpu in benchmark_cpus:
         LOG_CLI.info("benchmarking CPU %d", cpu)
 
@@ -912,29 +963,58 @@ def main() -> int:
                 check=True,
             )
 
-        subprocess.run(
-            [
-                f"bin\\PresentMon\\{presentmon_binary}",
-                "-stop_existing_session",
-                "-no_top",
-                "-timed",
-                str(cfg.settings.benchmark_duration),
-                "-process_name",
-                api_binname,
-                "-output_file",
-                f"{session_directory}\\CSVs\\CPU-{cpu}.csv",
-                "-terminate_after_timed",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
+        capture_failed = False
 
-        if not os.path.exists(f"{session_directory}\\CSVs\\CPU-{cpu}.csv"):
-            LOG_CLI.error(
-                "csv log unsuccessful, this may be due to a missing dependency or windows component",
+        try:
+            capture = subprocess.run(
+                [
+                    f"bin\\PresentMon\\{presentmon_binary}",
+                    "-stop_existing_session",
+                    "-no_top",
+                    "-timed",
+                    str(cfg.settings.benchmark_duration),
+                    "-process_name",
+                    api_binname,
+                    "-output_file",
+                    f"{session_directory}\\CSVs\\CPU-{cpu}.csv",
+                    "-terminate_after_timed",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                # a stuck trace session must never hang the whole run
+                timeout=cfg.settings.benchmark_duration + 120,
             )
-            shutil.rmtree(session_directory)
+
+            for line in (capture.stderr or "").strip().splitlines():
+                LOG_CLI.warning("presentmon: %s", line.strip())
+        except subprocess.TimeoutExpired:
+            LOG_CLI.error(
+                "presentmon did not stop after %d seconds, killing it",
+                cfg.settings.benchmark_duration + 120,
+            )
+            kill_processes(presentmon_binary)
+            capture_failed = True
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+
+            stderr = stderr or ""
+            LOG_CLI.error("presentmon exited with status %d", exc.returncode)
+            for line in stderr.strip().splitlines():
+                LOG_CLI.error("presentmon: %s", line.strip())
+            if "trace session" in stderr or "access denied" in stderr.lower():
+                print(CAPTURE_PRIVILEGE_HELP)
+            capture_failed = True
+
+        if capture_failed or not os.path.exists(f"{session_directory}\\CSVs\\CPU-{cpu}.csv"):
+            if not capture_failed:
+                LOG_CLI.error(
+                    "csv log unsuccessful, this may be due to a missing dependency or windows component",
+                )
+            kill_processes(api_binname)
+            shutil.rmtree(session_directory, ignore_errors=True)
             if reset_affinity(hwids_gpu) != 0:
                 LOG_CLI.error("failed to reset affinity")
                 return 1

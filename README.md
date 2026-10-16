@@ -16,15 +16,16 @@
 
 | 入口 | 需要管理员 | 重启显示设备 | 说明 |
 | --- | --- | --- | --- |
-| **1-safe-mode.bat** | 否 | **从不** | 完全不碰显示设备。用 `/affinity` 掩码把跑分程序绑定到目标核心，测的是「这个核心跑 GPU 负载表现如何」。**建议先用这个。** |
+| **1-safe-mode.bat** | 是¹ | **从不** | 完全不碰显示设备。用 `/affinity` 掩码把跑分程序绑定到目标核心，测的是「这个核心跑 GPU 负载表现如何」。**建议先用这个。** |
 | **2-igpu-mode.bat** | 是 | 只重启独显 | 显示器接核显输出时使用。真正写入 GPU 中断亲和性策略，然后只重启 `PCI\VEN_10DE`（NVIDIA），不会黑屏。 |
 | **3-original-mode.bat** | 是 | 全部非虚拟适配器 | 原版行为，用于复现 / 对比。有黑屏风险，需手动输入 `YES` 确认。 |
+¹ **为什么安全模式也要管理员？** 因为 PresentMon 采集帧时间需要启动一个 ETW 跟踪会话，Windows 只允许管理员或 `Performance Log Users` 组成员这么做（否则 PresentMon 以 exit code 6 报 `failed to start trace session: access denied`）。提权本身跟黑屏**无关**：黑屏来自「禁用/启用显示设备」，而安全模式从不碰显示设备。不想每次提权的话，用一次管理员权限把当前用户加进 `Performance Log Users` 组，之后安全模式就能不提权运行：`net localgroup "Performance Log Users" %USERNAME% /add`
 ## 快速开始
 
 不需要 `pip install`，没有任何第三方依赖，只要有 **Python 3.10+**：
 
 ```
-双击 1-safe-mode.bat
+双击 1-safe-mode.bat（会弹一次 UAC，点「是」）
 ```
 
 跑完会在 `captures\AutoGpuAffinity-<日期时间>\CSVs\` 下为每个核心生成一个 `CPU-<n>.csv`，并在终端打印与原版完全一致的对比表格（Max / Avg / Min / STDEV / 各百分位 / 1%·0.1%·0.01%·0.005% Low）。
@@ -78,9 +79,10 @@ Upstream [valleyofdoom/AutoGpuAffinity](https://github.com/valleyofdoom/AutoGpuA
 
 | Entry point | Admin | Restarts display devices | What it does |
 | --- | --- | --- | --- |
-| `1-safe-mode.bat` (safe) | no | never | Pins the benchmark process to each core with an `/affinity` mask. **Start here.** |
+| `1-safe-mode.bat` (safe) | yes² | never | Pins the benchmark process to each core with an `/affinity` mask. **Start here.** |
 | `2-igpu-mode.bat` (igpu) | yes | discrete GPU only | For a monitor plugged into the iGPU. Writes the real interrupt-affinity policy and restarts only `PCI\VEN_10DE`. |
 | `3-original-mode.bat` (original) | yes | all non-virtual adapters | Upstream behaviour, for comparison. Black-screen risk; requires typing `YES`. |
+² **Why does safe mode ask for admin then?** PresentMon has to start an ETW trace session to capture frametimes, and Windows only allows that for administrators or members of the `Performance Log Users` group — without it PresentMon exits with code 6 and `failed to start trace session: access denied`. Elevation is not what black-screens a machine; disabling the display device is, and safe mode never does that. To avoid the prompt: once, from an elevated prompt, run `net localgroup "Performance Log Users" %USERNAME% /add`, then sign out and back in.
 
 No `pip install`, no third-party dependencies, Python 3.10+. Results land in `captures\AutoGpuAffinity-<timestamp>\CSVs\CPU-<n>.csv` and in the same comparison table as upstream. To recover from a black screen: `py main.py --restore-display` (as administrator). Full technical write-up: [docs/README-safe.md](docs/README-safe.md).
 

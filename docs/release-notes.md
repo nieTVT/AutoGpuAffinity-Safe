@@ -1,3 +1,25 @@
+## v1.1.1-safe — 修复「安全模式无法采集帧时间」
+
+**现象**：安全模式下 PresentMon 直接失败，Python 侧抛
+
+```
+subprocess.CalledProcessError: Command '[...PresentMon-1.10.0-x64.exe', ...]' returned non-zero exit status 6
+```
+
+**原因**：PresentMon 要靠启动一个 ETW 跟踪会话来采集帧时间，而 Windows 只允许**管理员**或 **`Performance Log Users` 组成员**这么做。它不是黑屏风险 —— 黑屏来自「禁用 / 启用显示设备」，而安全模式从不碰显示设备。
+
+**本次修复**
+
+- `1-safe-mode.bat` 现在会自动请求 UAC，和另外两个入口一致
+- 开跑前增加权限自检（管理员身份，或 `whoami /groups` 中的 SID `S-1-5-32-559`）：不满足就立刻打印原因和处理办法并退出，不再跑到一半抛 traceback
+- PresentMon 增加超时保护（`benchmark_duration + 120` 秒）：万一跟踪会话卡死，不会再让整个跑分无限期挂起
+- 修复安全模式下仍会尝试清除 HKLM 中断亲和性策略、导致 `PermissionError: [WinError 5] Access is denied` 的问题
+- 补上默认 `config.ini`（内容等同安全模式），裸跑 `py main.py` 不再报 `config file not found`
+
+**不想每次提权？** 用一次管理员权限执行 `net localgroup "Performance Log Users" %USERNAME% /add`，注销后重新登录，之后安全模式就能以普通用户运行。
+
+---
+
 在原版基础上修改的安全分支：**在不关闭显示适配器的前提下**测试每个 CPU 核心运行 GPU 负载的表现。
 
 ## 三个入口

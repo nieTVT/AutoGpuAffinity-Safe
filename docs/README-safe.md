@@ -69,7 +69,7 @@ hwids_gpu: list[str] = [gpu.PnPDeviceID for gpu in wmi.WMI().Win32_VideoControll
 
 - **完全不调用** `SetupDiCallClassInstaller` / 禁用 / 启用；
 - 只用 `start "" /affinity <掩码>` 把基准进程**钉在目标核心**上跑；
-- **不需要管理员权限**，因此不可能黑屏。
+- **从不接触显示设备**，因此不可能黑屏。（不过采集帧时间仍需提权，见第九节）
 
 ### 2. 即使开启重启模式，也只作用于筛选后的设备
 
@@ -97,7 +97,7 @@ hwids_gpu: list[str] = [gpu.PnPDeviceID for gpu in wmi.WMI().Win32_VideoControll
 ```bat
 py main.py --list-devices     :: 只读：列出所有显示设备及其状态
 py main.py --dry-run          :: 只读：打印本次基准计划，不启动任何东西
-py main.py                    :: 安全模式跑基准（不需要管理员）
+py main.py                    :: 安全模式跑基准（显示设备不动；采集需管理员）
 ```
 
 可选 / 高级：
@@ -166,7 +166,7 @@ affinity_devices=[]           ; 空=所有"真实的、未禁用的"显示适配
 
 ### 推荐流程
 
-**第 1 步：先用安全模式确认整条流水线能出表格（不需要管理员）**
+**第 1 步：先用安全模式确认整条流水线能出表格（以管理员运行，但显示设备不动）**
 
 ```bat
 cd /d D:\TOOL\AutoGpuAffinity
@@ -276,3 +276,26 @@ physical_device=-1
 
 **验证渲染到底落在哪块卡上**：跑的时候打开 任务管理器 → 性能 → 逐个 GPU 看哪一块的「3D」占用在动；
 应看到 5090 的 3D 升高、Intel 的 3D 基本不动。
+
+## 九、PresentMon 需要管理员权限（安全模式为什么也要提权）
+
+安全模式**从不**禁用或启用显示设备，所以它不可能黑屏。但**采集帧时间**这一步仍然需要提权。
+
+`bin\PresentMon\PresentMon-1.10.0-x64.exe` 要启动一个 ETW 跟踪会话才能记录 present 事件，而 Windows 只允许**管理员**、或 **`Performance Log Users` 组成员**这么做。不满足时 PresentMon 立刻失败：
+
+```
+error: failed to start trace session: access denied.
+       PresentMon requires either administrative privileges or to be run by a user in the
+       "Performance Log Users" user group.  View the readme for more details.
+```
+
+在 Python 侧表现为 `subprocess.CalledProcessError: ... returned non-zero exit status 6`。
+
+结论：
+
+- **提权本身不是黑屏的原因。** 黑屏来自「禁用 / 启用显示设备」，而安全模式从不做这件事，所以安全模式以管理员运行是安全的。
+- `1-safe-mode.bat` 现在会和另外两个入口一样，自动请求 UAC。
+- 想彻底不提权：用一次管理员权限执行 `net localgroup "Performance Log Users" %USERNAME% /add`，注销后重新登录，之后安全模式就能以普通用户运行。
+- 程序现在会在开跑前自检（`has_capture_privilege()`：检查管理员身份，或 `whoami /groups` 里有没有 SID `S-1-5-32-559`），不满足就立刻报错退出，不再跑到一半抛 traceback。
+- PresentMon 调用加了超时保护（`benchmark_duration + 120` 秒）；万一跟踪会话卡死，也不会再让整个跑分无限期挂起。
+- 采集失败时会中止本次跑分、清理目录、还原亲和策略，并打印上面这段原因说明。

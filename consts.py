@@ -1,1 +1,1 @@
-VERSION = "1.1.0-safe"
+VERSION = "1.1.1-safe"
